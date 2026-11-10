@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Build
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name KeySim keyboard_api.py
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/KeySim.app dist/KeySim-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeySim-${{ runner.os }}
+          if-no-files-found: ignore
+          path: |
+            dist/KeySim.exe
+            dist/KeySim-macos.zip
