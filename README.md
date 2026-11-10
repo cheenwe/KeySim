@@ -93,7 +93,10 @@ python3 -m PyInstaller --noconfirm --clean --onefile --windowed -n KeySim keyboa
 Windows 与 macOS runner 上打包，并把产物上传为 Artifact：
 
 - `KeySim-Windows`：`KeySim.exe`
-- `macOS`：`KeySim-macos.zip`（含 `KeySim.app`）
+- `KeySim-macOS`：`KeySim-macos.zip`（含 `KeySim.app`）
+
+如果是打 tag 触发的，构建成功后还会自动创建对应的 GitHub Release，
+并挂上 `KeySim.exe` 与 `KeySim-macos.zip` 两个附件。
 
 ## 目录结构
 
