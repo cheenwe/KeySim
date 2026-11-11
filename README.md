@@ -66,7 +66,9 @@ KeySim 自己身上，按键会输入到「本地测试输入框」而不是目�
 ```bash
 curl "http://127.0.0.1:8765/press?key=1"
 curl "http://127.0.0.1:8765/press?keys=1,2,3"
+curl "http://127.0.0.1:8765/press?keys=ctrl%2Bc,ctrl%2Bv"   # 组合键
 curl -X POST http://127.0.0.1:8765/press -H "Content-Type: application/json" -d "{\"key\":\"6\"}"
+curl -X POST http://127.0.0.1:8765/press -H "Content-Type: application/json" -d "{\"keys\":[\"ctrl+shift+s\",\"enter\"]}"
 curl http://127.0.0.1:8765/status
 ```
 
@@ -86,6 +88,19 @@ curl http://127.0.0.1:8765/status
 - 方向键 `up` `down` `left` `right`
 - 功能键 `f1`~`f12`
 - 修饰键 `ctrl` `alt` `shift`（Windows 另有 `win`，macOS 为 `cmd`）
+
+### 组合键
+
+用 `+` 连接修饰键与普通键，修饰键可叠加，普通键写在最后：
+
+```text
+ctrl+c        ctrl+shift+s        alt+f4        win+r        cmd+shift+4
+```
+
+- 一次请求里可用逗号分隔多个按键/组合键，例如 `keys=ctrl+c,ctrl+v,enter`
+- GET 请求中的 `+` 会被解析成空格，需写成 `%2B`（`keys=ctrl%2Bc`），
+  程序也兼容空格写法（`keys=ctrl c`）
+- `a+b` 这类修饰键不在前面的写法会被判为无效按键
 
 ## 打包
 

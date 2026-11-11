@@ -53,6 +53,7 @@ for _c in "abcdefghijklmnopqrstuvwxyz":
     WIN_KEY_MAP[_c] = ord(_c.upper())
 for _i in range(1, 13):
     WIN_KEY_MAP["f%d" % _i] = 0x6F + _i  # F1=0x70
+WIN_KEY_MAP["cmd"] = 0x5B  # macOS 叫法，等价于 Win 键
 
 # macOS 虚拟键码（CGKeyCode）
 MAC_KEY_MAP = {
@@ -69,6 +70,15 @@ MAC_KEY_MAP = {
     "j": 38, "k": 40, "n": 45, "m": 46,
     "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
     "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+}
+MAC_KEY_MAP["win"] = 55  # Windows 叫法，等价于 Command 键
+
+MODIFIER_NAMES = {"ctrl", "alt", "shift", "win", "cmd"}
+MAC_MODIFIER_FLAGS = {
+    "ctrl": 0x00040000,   # kCGEventFlagMaskControl
+    "shift": 0x00020000,  # kCGEventFlagMaskShift
+    "alt": 0x00080000,    # kCGEventFlagMaskAlternate
+    "cmd": 0x00100000,    # kCGEventFlagMaskCommand
 }
 
 
@@ -149,6 +159,13 @@ if IS_WINDOWS:
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+    def _win_key_input(vk, key_up=False):
+        item = _INPUT(type=INPUT_KEYBOARD)
+        item.ki.wVk = vk
+        item.ki.wScan = _user32.MapVirtualKeyW(vk, 0)
+        item.ki.dwFlags = KEYEVENTF_KEYUP if key_up else 0
+        return item
+
 elif IS_MAC:
     _cg = ctypes.cdll.LoadLibrary(
         "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
@@ -161,6 +178,8 @@ elif IS_MAC:
     _cg.CGEventCreateKeyboardEvent.argtypes = (ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool)
     _cg.CGEventPost.restype = None
     _cg.CGEventPost.argtypes = (ctypes.c_uint32, ctypes.c_void_p)
+    _cg.CGEventSetFlags.restype = None
+    _cg.CGEventSetFlags.argtypes = (ctypes.c_void_p, ctypes.c_uint64)
     _cf.CFRelease.restype = None
     _cf.CFRelease.argtypes = (ctypes.c_void_p,)
     _as.AXIsProcessTrusted.restype = ctypes.c_bool
@@ -351,6 +370,38 @@ def _resolve_key(name):
     return None
 
 
+def _combo_parts(name):
+    """拆分组合键，如 "ctrl+shift+s"；GET 里 + 会变成空格，因此也接受空格分隔。"""
+    text = str(name).strip().lower()
+    if not text:
+        return []
+    if "+" in text or "＋" in text:
+        raw = text.replace("＋", "+").split("+")
+    else:
+        words = text.split()
+        if len(words) > 1 and all(w in MODIFIER_NAMES for w in words[:-1]):
+            raw = words
+        else:
+            raw = [text]
+    return [part.strip() for part in raw if part.strip()]
+
+
+def _parse_combo(name):
+    """解析单个按键或组合键，返回 (名称列表, 键码列表)，无效时返回 None。"""
+    parts = _combo_parts(name)
+    if not parts:
+        return None
+    if len(parts) > 1 and any(p not in MODIFIER_NAMES for p in parts[:-1]):
+        return None  # 修饰键必须写在前面，且只有最后一个是普通键
+    codes = []
+    for part in parts:
+        code = _resolve_key(part)
+        if code is None:
+            return None
+        codes.append(code)
+    return parts, codes
+
+
 def _mac_press(keycode):
     down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
     if not down:
@@ -366,31 +417,68 @@ def _mac_press(keycode):
     return True, ""
 
 
-def simulate_key(name):
-    """按名称发送一次“按下 + 抬起”，返回 (是否成功, 失败原因)。"""
-    keycode = _resolve_key(name)
-    if keycode is None:
-        return False, "不支持的按键名"
-    if IS_WINDOWS:
-        down = _INPUT(type=INPUT_KEYBOARD)
-        down.ki.wVk = keycode
-        down.ki.wScan = _user32.MapVirtualKeyW(keycode, 0)
-        down.ki.dwFlags = 0
-        up = _INPUT(type=INPUT_KEYBOARD)
-        up.ki.wVk = keycode
-        up.ki.wScan = down.ki.wScan
-        up.ki.dwFlags = KEYEVENTF_KEYUP
-        if _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(_INPUT)) != 1:
-            return False, _win_error_text(ctypes.get_last_error())
+def _mac_press_combo(parts, codes):
+    flags = 0
+    for name in parts[:-1]:
+        flags |= MAC_MODIFIER_FLAGS["cmd" if name == "win" else name]
+    down = _cg.CGEventCreateKeyboardEvent(None, codes[-1], True)
+    if not down:
+        return False, "创建键盘事件失败"
+    _cg.CGEventSetFlags(down, flags)
+    _cg.CGEventPost(K_CG_HID_EVENT_TAP, down)
+    _cf.CFRelease(down)
+    time.sleep(0.02)
+    up = _cg.CGEventCreateKeyboardEvent(None, codes[-1], False)
+    if not up:
+        return False, "创建键盘事件失败"
+    _cg.CGEventSetFlags(up, flags)
+    _cg.CGEventPost(K_CG_HID_EVENT_TAP, up)
+    _cf.CFRelease(up)
+    return True, ""
+
+
+def _win_send(inputs):
+    arr = (_INPUT * len(inputs))(*inputs)
+    if _user32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT)) != len(inputs):
+        return False, _win_error_text(ctypes.get_last_error())
+    return True, ""
+
+
+def _win_press_combo(codes):
+    modifiers, main_key = codes[:-1], codes[-1]
+    if modifiers:
+        ok, reason = _win_send([_win_key_input(vk) for vk in modifiers])
+        if not ok:
+            return False, reason
         time.sleep(0.02)
-        if _user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(_INPUT)) != 1:
-            return False, _win_error_text(ctypes.get_last_error())
-        return True, ""
+    ok, reason = _win_send([_win_key_input(main_key), _win_key_input(main_key, True)])
+    if not ok:
+        if modifiers:  # 避免修饰键一直处于按下状态
+            _win_send([_win_key_input(vk, True) for vk in reversed(modifiers)])
+        return False, reason
+    if modifiers:
+        time.sleep(0.01)
+        ok, reason = _win_send([_win_key_input(vk, True) for vk in reversed(modifiers)])
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def simulate_key(name):
+    """发送一次按键或组合键（如 ctrl+c），返回 (是否成功, 失败原因)。"""
+    parsed = _parse_combo(name)
+    if parsed is None:
+        return False, "不支持的按键名"
+    parts, codes = parsed
+    if IS_WINDOWS:
+        return _win_press_combo(codes)
     if IS_MAC:
         if not mac_accessibility_trusted():
             return False, ("未获得“辅助功能”权限：请在系统设置 → 隐私与安全性 → 辅助功能中"
                            "勾选运行本程序的终端 / Python")
-        return _mac_press(keycode)
+        if len(codes) == 1:
+            return _mac_press(codes[0])
+        return _mac_press_combo(parts, codes)
     return False, "当前系统 %s 暂不支持模拟按键" % sys.platform
 
 
@@ -401,14 +489,14 @@ def press_keys(keys):
     if not ok:
         for key in keys:
             name = str(key).strip()
-            if name and _resolve_key(name) is not None:
+            if name and _parse_combo(name) is not None:
                 failed.append(name)
                 errors[name] = reason
     for key in keys:
         name = str(key).strip()
         if not name:
             continue
-        if _resolve_key(name) is None:
+        if _parse_combo(name) is None:
             invalid.append(name)
             continue
         if not ok:  # 目标窗口没能切到前台，不为错误的窗口发送按键
@@ -633,8 +721,10 @@ class App:
         self.test_entry = ttk.Entry(test_row)
         self.test_entry.pack(side="left", fill="x", expand=True, padx=6)
         ttk.Label(keys, text="提示：点击上面按钮时，按键会输入到本地测试输入框，便于本机验证；"
-                             "通过接口发送的按键则进入当前获得焦点的窗口。",
-                  foreground="#666", wraplength=600, justify="left").pack(
+                             "通过接口发送的按键则进入当前获得焦点的窗口。"
+                             "支持组合键，如 ctrl+c、ctrl+shift+s（GET 请求需写成 ctrl%2Bc，"
+                             "或用空格分隔：keys=ctrl c）。",
+                  foreground="#666", wraplength=620, justify="left").pack(
             anchor="w", padx=10, pady=(0, 8))
 
         log_frame = ttk.LabelFrame(self.root, text="接收到的指令")
