@@ -136,6 +136,18 @@ if IS_WINDOWS:
     _user32.IsIconic.restype = wintypes.BOOL
     _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
     _user32.ShowWindow.restype = wintypes.BOOL
+    _user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+    _user32.AttachThreadInput.restype = wintypes.BOOL
+    _user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+    _user32.BringWindowToTop.restype = wintypes.BOOL
+    _user32.SetActiveWindow.argtypes = (wintypes.HWND,)
+    _user32.SetActiveWindow.restype = wintypes.HWND
+    _user32.keybd_event.argtypes = (wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t)
+    _user32.keybd_event.restype = None
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 elif IS_MAC:
     _cg = ctypes.cdll.LoadLibrary(
@@ -234,24 +246,68 @@ def find_window(title):
     return None
 
 
-def _activate_window(hwnd, timeout=0.8):
-    """把窗口切到前台，返回是否成功。"""
-    if _user32.IsIconic(hwnd):
-        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    _user32.SetForegroundWindow(hwnd)
+def _window_title(hwnd):
+    if not hwnd:
+        return ""
+    length = _user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    _user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def _wait_foreground(hwnd, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _user32.GetForegroundWindow() == hwnd:
             return True
         time.sleep(0.02)
-    # SetForegroundWindow 可能被系统前台锁定策略拒绝，再试一次备用接口
-    _user32.SwitchToThisWindow(hwnd, True)
-    deadline = time.time() + 0.4
-    while time.time() < deadline:
-        if _user32.GetForegroundWindow() == hwnd:
-            return True
-        time.sleep(0.02)
     return _user32.GetForegroundWindow() == hwnd
+
+
+def _activate_window(hwnd, timeout=1.2):
+    """把窗口切到前台，返回是否成功。
+
+    Windows 只允许前台进程切换前台窗口，而接口请求来自后台线程，因此需要
+    通过 AttachThreadInput 借用前台线程的输入状态，必要时再用 ALT 键解除限制。
+    """
+    if _user32.GetForegroundWindow() == hwnd:
+        return True
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        time.sleep(0.05)
+
+    _user32.SetForegroundWindow(hwnd)
+    if _wait_foreground(hwnd, 0.25):
+        return True
+
+    fg = _user32.GetForegroundWindow()
+    fg_tid = 0
+    attached = False
+    if fg and fg != hwnd:
+        fg_tid = _user32.GetWindowThreadProcessId(fg, None)
+        self_tid = _kernel32.GetCurrentThreadId()
+        if fg_tid and fg_tid != self_tid:
+            attached = bool(_user32.AttachThreadInput(fg_tid, self_tid, True))
+        try:
+            _user32.BringWindowToTop(hwnd)
+            _user32.SetForegroundWindow(hwnd)
+            _user32.SetActiveWindow(hwnd)
+        finally:
+            if attached:
+                _user32.AttachThreadInput(fg_tid, self_tid, False)
+        if _wait_foreground(hwnd, 0.3):
+            return True
+
+    # 最后尝试：模拟一次 ALT 轻敲解除前台锁定，再切窗口
+    VK_MENU = 0x12
+    _user32.keybd_event(VK_MENU, 0, 0, 0)
+    _user32.SetForegroundWindow(hwnd)
+    _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    if _wait_foreground(hwnd, 0.4):
+        return True
+
+    _user32.SwitchToThisWindow(hwnd, True)
+    return _wait_foreground(hwnd, 0.4)
 
 
 def focus_target_window():
@@ -262,7 +318,9 @@ def focus_target_window():
     if not hwnd:
         return False, "找不到目标窗口「%s」，请确认窗口已打开" % _target_title
     if not _activate_window(hwnd):
-        return False, "无法激活目标窗口「%s」，请手动点击该窗口后再试" % _target_title
+        current = _window_title(_user32.GetForegroundWindow()) or "未知"
+        return False, ("无法激活目标窗口「%s」（当前前台窗口：%s），"
+                       "请手动点击该窗口后再试" % (_target_title, current))
     time.sleep(0.12)  # 留出切换焦点的时间，避免按键仍发到旧窗口
     return True, ""
 
