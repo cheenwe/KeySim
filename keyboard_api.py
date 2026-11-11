@@ -255,13 +255,29 @@ def _window_title(hwnd):
     return buf.value
 
 
+def _window_pid(hwnd):
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def _foreground_is_target(hwnd):
+    """当前前台窗口是否就是目标窗口（含同一进程的其它顶层窗口）。"""
+    fg = _user32.GetForegroundWindow()
+    if not fg:
+        return False
+    if fg == hwnd:
+        return True
+    return _window_pid(fg) == _window_pid(hwnd)
+
+
 def _wait_foreground(hwnd, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _user32.GetForegroundWindow() == hwnd:
+        if _foreground_is_target(hwnd):
             return True
         time.sleep(0.02)
-    return _user32.GetForegroundWindow() == hwnd
+    return _foreground_is_target(hwnd)
 
 
 def _activate_window(hwnd, timeout=1.2):
@@ -270,14 +286,14 @@ def _activate_window(hwnd, timeout=1.2):
     Windows 只允许前台进程切换前台窗口，而接口请求来自后台线程，因此需要
     通过 AttachThreadInput 借用前台线程的输入状态，必要时再用 ALT 键解除限制。
     """
-    if _user32.GetForegroundWindow() == hwnd:
+    if _foreground_is_target(hwnd):
         return True
     if _user32.IsIconic(hwnd):
         _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         time.sleep(0.05)
 
     _user32.SetForegroundWindow(hwnd)
-    if _wait_foreground(hwnd, 0.25):
+    if _wait_foreground(hwnd, 0.15):
         return True
 
     fg = _user32.GetForegroundWindow()
@@ -295,7 +311,7 @@ def _activate_window(hwnd, timeout=1.2):
         finally:
             if attached:
                 _user32.AttachThreadInput(fg_tid, self_tid, False)
-        if _wait_foreground(hwnd, 0.3):
+        if _wait_foreground(hwnd, 0.15):
             return True
 
     # 最后尝试：模拟一次 ALT 轻敲解除前台锁定，再切窗口
@@ -303,11 +319,11 @@ def _activate_window(hwnd, timeout=1.2):
     _user32.keybd_event(VK_MENU, 0, 0, 0)
     _user32.SetForegroundWindow(hwnd)
     _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-    if _wait_foreground(hwnd, 0.4):
+    if _wait_foreground(hwnd, 0.2):
         return True
 
     _user32.SwitchToThisWindow(hwnd, True)
-    return _wait_foreground(hwnd, 0.4)
+    return _wait_foreground(hwnd, 0.2)
 
 
 def focus_target_window():
@@ -321,7 +337,7 @@ def focus_target_window():
         current = _window_title(_user32.GetForegroundWindow()) or "未知"
         return False, ("无法激活目标窗口「%s」（当前前台窗口：%s），"
                        "请手动点击该窗口后再试" % (_target_title, current))
-    time.sleep(0.12)  # 留出切换焦点的时间，避免按键仍发到旧窗口
+    time.sleep(0.05)  # 留出切换焦点的时间，避免按键仍发到旧窗口
     return True, ""
 
 
@@ -451,7 +467,9 @@ def _make_handler(app):
             self.wfile.write(body)
 
         def _handle_press(self, keys, source):
+            started = time.perf_counter()
             pressed, failed, invalid, errors = press_keys(keys)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
             if pressed or failed or invalid:
                 app.on_event({
                     "source": source,
@@ -461,6 +479,7 @@ def _make_handler(app):
                     "errors": errors,
                     "client": "%s:%s" % self.client_address[:2],
                     "time": datetime.now().strftime("%H:%M:%S"),
+                    "elapsed_ms": elapsed_ms,
                 })
             ok = bool(pressed) and not failed and not invalid
             self._send_json({
@@ -470,6 +489,7 @@ def _make_handler(app):
                 "invalid": invalid,
                 "errors": errors,
                 "simulated": SUPPORTS_SIMULATION,
+                "elapsed_ms": elapsed_ms,
             }, 200 if ok else 400)
 
         def _keys_from_params(self, data):
@@ -696,8 +716,10 @@ class App:
         if not get_target_window():
             self.test_entry.focus_force()
             self.root.update_idletasks()
+        started = time.perf_counter()
         pressed, failed, invalid, errors = press_keys([key])
-        self.append_log("本地", pressed, failed, invalid, errors, "窗口按钮")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.append_log("本地", pressed, failed, invalid, errors, "窗口按钮", elapsed_ms)
 
     # ------------------------------------------------------------ 日志
     def poll_queue(self):
@@ -707,10 +729,11 @@ class App:
             except queue.Empty:
                 break
             self.append_log(event["source"], event["pressed"], event["failed"],
-                            event["invalid"], event.get("errors", {}), event["client"])
+                            event["invalid"], event.get("errors", {}), event["client"],
+                            event.get("elapsed_ms"))
         self.root.after(100, self.poll_queue)
 
-    def append_log(self, source, pressed, failed, invalid, errors, client):
+    def append_log(self, source, pressed, failed, invalid, errors, client, elapsed_ms=None):
         stamp = datetime.now().strftime("%H:%M:%S")
         parts = []
         if pressed:
@@ -720,6 +743,8 @@ class App:
             parts.append("模拟失败 %s%s" % (" ".join(failed), "（%s）" % reason if reason else ""))
         if invalid:
             parts.append("无效按键 %s" % " ".join(invalid))
+        if elapsed_ms is not None:
+            parts.append("耗时 %d ms" % elapsed_ms)
         target = get_target_window()
         target_suffix = " → %s" % target if target else ""
         line = "[%s] %s ← %s%s   %s\n" % (
