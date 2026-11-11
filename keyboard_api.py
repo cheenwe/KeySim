@@ -4,7 +4,8 @@ KeySim · 键盘指令模拟器（API + 可视化窗口）
 
 功能：
 1. 启动一个 HTTP API 服务，接收 "1" "2" "3" "4" "5" "6" 等按键指令；
-2. 模拟真实按键（发给当前获得焦点的窗口）：Windows 用 SendInput，macOS 用 CGEvent；
+2. 模拟真实按键：Windows 用 SendInput，macOS 用 CGEvent；默认发给当前焦点窗口，
+   Windows 可指定目标窗口，每次发送前自动切到前台；
 3. 窗口内有 1~6 可点击按钮，并实时显示收到的指令。
 
 macOS 说明：需要在「系统设置 → 隐私与安全性 → 辅助功能」中授权运行本程序的
@@ -117,6 +118,25 @@ if IS_WINDOWS:
     _user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
     _user32.MapVirtualKeyW.restype = wintypes.UINT
 
+    _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    _user32.EnumWindows.argtypes = (_WNDENUMPROC, wintypes.LPARAM)
+    _user32.EnumWindows.restype = wintypes.BOOL
+    _user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
+    _user32.SwitchToThisWindow.argtypes = (wintypes.HWND, wintypes.BOOL)
+    _user32.SwitchToThisWindow.restype = None
+    _user32.IsIconic.argtypes = (wintypes.HWND,)
+    _user32.IsIconic.restype = wintypes.BOOL
+    _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    _user32.ShowWindow.restype = wintypes.BOOL
+
 elif IS_MAC:
     _cg = ctypes.cdll.LoadLibrary(
         "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
@@ -162,6 +182,89 @@ def _win_error_text(code):
     if code:
         return "错误码 %d" % code
     return "SendInput 返回 0"
+
+
+# ---------------------------------------------------------------- 目标窗口
+# 模拟按键只会发给当前获得焦点的窗口，因此可配置一个目标窗口，
+# 每次发送前自动把它切到前台（Windows）。
+_target_title = ""
+
+
+def set_target_window(title):
+    global _target_title
+    _target_title = (title or "").strip()
+
+
+def get_target_window():
+    return _target_title
+
+
+def list_windows():
+    """列出可见且带标题的顶层窗口，返回 [(hwnd, 标题)]。"""
+    if not IS_WINDOWS:
+        return []
+    items = []
+
+    @_WNDENUMPROC
+    def _enum(hwnd, _lparam):
+        if _user32.IsWindowVisible(hwnd):
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.strip()
+                if title:
+                    items.append((hwnd, title))
+        return True
+
+    _user32.EnumWindows(_enum, 0)
+    return items
+
+
+def find_window(title):
+    """按标题精确匹配，失败则按关键字模糊匹配，返回 hwnd 或 None。"""
+    windows = list_windows()
+    for hwnd, text in windows:
+        if text == title:
+            return hwnd
+    lowered = title.lower()
+    for hwnd, text in windows:
+        if lowered in text.lower():
+            return hwnd
+    return None
+
+
+def _activate_window(hwnd, timeout=0.8):
+    """把窗口切到前台，返回是否成功。"""
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    _user32.SetForegroundWindow(hwnd)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.02)
+    # SetForegroundWindow 可能被系统前台锁定策略拒绝，再试一次备用接口
+    _user32.SwitchToThisWindow(hwnd, True)
+    deadline = time.time() + 0.4
+    while time.time() < deadline:
+        if _user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.02)
+    return _user32.GetForegroundWindow() == hwnd
+
+
+def focus_target_window():
+    """按配置激活目标窗口；返回 (是否成功, 失败原因)。未配置目标时直接成功。"""
+    if not _target_title or not IS_WINDOWS:
+        return True, ""
+    hwnd = find_window(_target_title)
+    if not hwnd:
+        return False, "找不到目标窗口「%s」，请确认窗口已打开" % _target_title
+    if not _activate_window(hwnd):
+        return False, "无法激活目标窗口「%s」，请手动点击该窗口后再试" % _target_title
+    time.sleep(0.12)  # 留出切换焦点的时间，避免按键仍发到旧窗口
+    return True, ""
 
 
 def _resolve_key(name):
@@ -220,6 +323,13 @@ def simulate_key(name):
 def press_keys(keys):
     """按顺序模拟一组按键，返回 (成功的键, 模拟失败的键, 无效的键, 失败原因字典)。"""
     pressed, failed, invalid, errors = [], [], [], {}
+    ok, reason = focus_target_window()
+    if not ok:
+        for key in keys:
+            name = str(key).strip()
+            if name and _resolve_key(name) is not None:
+                failed.append(name)
+                errors[name] = reason
     for key in keys:
         name = str(key).strip()
         if not name:
@@ -227,12 +337,14 @@ def press_keys(keys):
         if _resolve_key(name) is None:
             invalid.append(name)
             continue
-        ok, reason = simulate_key(name)
-        if ok:
+        if not ok:  # 目标窗口没能切到前台，不为错误的窗口发送按键
+            continue
+        success, detail = simulate_key(name)
+        if success:
             pressed.append(name)
         else:
             failed.append(name)
-            errors[name] = reason
+            errors[name] = detail
     return pressed, failed, invalid, errors
 
 
@@ -331,6 +443,7 @@ def _make_handler(app):
                     "platform": sys.platform,
                     "simulated": SUPPORTS_SIMULATION,
                     "accessibility_trusted": mac_accessibility_trusted(),
+                    "target_window": get_target_window(),
                 })
                 return
             if url.path == "/press":
@@ -371,8 +484,8 @@ class App:
         self.server = None
 
         root.title("KeySim · 键盘指令模拟器")
-        root.geometry("640x560")
-        root.minsize(560, 480)
+        root.geometry("660x660")
+        root.minsize(600, 560)
         self._build_ui()
         self.toggle_topmost()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -402,6 +515,24 @@ class App:
         self.status_var = tk.StringVar(value="未启动")
         ttk.Label(top, textvariable=self.status_var, foreground="#0a7d32").pack(
             anchor="w", padx=10, pady=(0, 6))
+
+        if IS_WINDOWS:
+            target = ttk.LabelFrame(self.root, text="目标窗口（可选）")
+            target.pack(fill="x", **pad)
+            trow = ttk.Frame(target)
+            trow.pack(fill="x", padx=8, pady=6)
+            ttk.Label(trow, text="窗口标题").pack(side="left")
+            self.target_var = tk.StringVar(value=get_target_window())
+            self.target_box = ttk.Combobox(trow, textvariable=self.target_var, width=30)
+            self.target_box.pack(side="left", fill="x", expand=True, padx=6)
+            ttk.Button(trow, text="刷新列表", command=self.refresh_windows).pack(side="left")
+            self.target_var.trace_add("write", lambda *_: set_target_window(self.target_var.get()))
+            ttk.Label(target,
+                      text="填写窗口标题关键字（如 NeoRec），每次发送前会自动切到该窗口再按键；"
+                           "留空表示发给当前焦点窗口。",
+                      foreground="#666", wraplength=600, justify="left").pack(
+                anchor="w", padx=10, pady=(0, 8))
+            self.refresh_windows()
 
         keys = ttk.LabelFrame(self.root, text="按键（点击可直接测试）")
         keys.pack(fill="x", **pad)
@@ -496,10 +627,17 @@ class App:
     def toggle_topmost(self):
         self.root.attributes("-topmost", self.topmost_var.get())
 
+    def refresh_windows(self):
+        if not IS_WINDOWS:
+            return
+        own_title = self.root.title()
+        self.target_box["values"] = [t for _, t in list_windows() if t != own_title]
+
     def local_press(self, key):
-        # 让本地测试输入框先拿到焦点，这样按键效果能直接看到
-        self.test_entry.focus_force()
-        self.root.update_idletasks()
+        # 未指定目标窗口时，把焦点给本地测试输入框，便于本机直接看到效果
+        if not get_target_window():
+            self.test_entry.focus_force()
+            self.root.update_idletasks()
         pressed, failed, invalid, errors = press_keys([key])
         self.append_log("本地", pressed, failed, invalid, errors, "窗口按钮")
 
@@ -524,7 +662,10 @@ class App:
             parts.append("模拟失败 %s%s" % (" ".join(failed), "（%s）" % reason if reason else ""))
         if invalid:
             parts.append("无效按键 %s" % " ".join(invalid))
-        line = "[%s] %s ← %s   %s\n" % (stamp, source, client, "；".join(parts) or "空指令")
+        target = get_target_window()
+        target_suffix = " → %s" % target if target else ""
+        line = "[%s] %s ← %s%s   %s\n" % (
+            stamp, source, client, target_suffix, "；".join(parts) or "空指令")
         self.log_text.config(state="normal")
         self.log_text.insert("end", line)
         self.log_text.see("end")
